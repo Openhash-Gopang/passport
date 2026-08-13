@@ -126,13 +126,29 @@ hit(status:active)이면 즉시 재사용하고, miss면 STEP 1-B(최초 조사)
 `procedure_maps.steps[].pathfinder`를 갱신해 쓰는 방식 — K-Compose STEP1 캐시 조회는
 그대로 유지하면서 조회 결과에 이미 최신 가중치가 실려 있게 한다
 
-**해결되지 않은 연결고리 (다음 결정 필요)**: `procedure_maps.steps[].atom_id`/`org_id`와
-Pathfinder의 집계 키(`dept_tasks.task_type` × `target_id`)가 서로 다른 이름공간이다 —
-atom_id는 `atom_rows`(REPORT/DECISION/PAY/QUERY/ADJUDICATE 패턴 카탈로그) 소속이고,
-dept_task는 GOV_TASK의 `agency`/`task_key`에서 파생된다. 이 둘을 잇는 명시적 매핑(또는
-정규화 규칙)이 아직 없다 — atom_id 실행이 실제로 어떤 GOV_TASK(agency/task_key)를
-호출하는지는 `_execReport`/`_execDecision` 등 실행부 코드마다 다르게 구현돼 있어, 이
-매핑을 먼저 확정해야 `predicted_duration_sec`를 실제로 채울 수 있다
+**연결고리 해결 (2026-08-13 구현 완료)**: 실사 결과 진짜 문제는 이름공간 불일치가
+아니라 **두 실행 경로 자체가 분리돼 있었다는 것**이었다 — K-Execute의 `atom_id` 분기는
+`automation_sp`가 있으면 `CALL_GOVSYS`(atom_rows 전용 자동화 레지스트리, `_callGovSys`)로만
+위임했고, `GOV_TASK_SUBMIT_REQUEST`(`/gov/task/submit`→`handleGovTaskSubmit`→`dept_task`
+생성, Pathfinder의 유일한 데이터 원천)는 `kpublic`(SP-10) 등 도메인 SP만 쓰도록 지침돼
+있어 K-Execute를 거친 요청은 애초에 `dept_task`를 생성하지 않았다. 게다가 `CALL_GOVSYS`
+경로는 `connected:true`인 atom이 사실상 없어 대부분 `requires_user_action`으로 끝나는,
+현재 사실상 미작동 중인 경로였다.
+
+해법: `atom_rows`에 `gov_task_agency`/`gov_task_key` 필드를 신설해(1787500001 마이그레이션,
+`org_profiles.gov_tree_ref`와 동일한 "얇은 포인터" 패턴) `REQUIRED_DOCUMENTS_REGISTRY`를
+직접 가리키게 했다. `SP-22_kexecute` STEP1을 수정해, 이 두 필드가 모두 있으면
+`CALL_GOVSYS` 분기보다 **먼저** `GOV_TASK_SUBMIT_REQUEST`를 내도록 했다 — "정식
+접수·추적 시작"은 실제 API 자동화 여부(`automation_sp`)나 인간 전속 여부(`ADJUDICATE`
+패턴 등)와 무관하게 항상 먼저 이뤄진다는 원칙이다. 실제 매핑이 확인된 첫 사례는
+`court-filing`(ADJUDICATE, org_class=`court`) ↔
+`REQUIRED_DOCUMENTS_REGISTRY.court.personal_bankruptcy_filing` — 둘 다 "개인파산
+신청서 접수"라는 같은 실제 절차를 가리킨다.
+
+**남은 작업**: 이번 마이그레이션+SP 수정으로 이름공간은 연결됐지만, 실제 매핑은 아직
+`court-filing` 1건뿐이다 — 나머지 `atom_rows`(gov24-family-cert 등)와
+`REQUIRED_DOCUMENTS_REGISTRY`(현재 kcc 1건 더) 사이의 대응을 하나씩 확인해 채워야
+`procedure_maps.steps[].pathfinder`가 의미 있는 표본을 모을 수 있다.
 
 **2.2(전역 최적화, min-cost flow)와의 관계**: 이 확장은 K-Compose의 "단건 캐시 조회"
 시점에 가중치를 얹어주는 것까지다 — 동시에 들어오는 여러 요청을 함께 조율하는 진짜
