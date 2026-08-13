@@ -82,7 +82,65 @@
 새 병목이 됨). 실제로는 **최소비용흐름(min-cost flow)** 문제로 정식화해, 다수 요청을 동시에
 배정하는 전역 최적화를 수행한다.
 
-## 3. 2단계 — 구조 개선 제안 (절차·기관 재설계)
+### 2.3 procedure_maps 통합 — 기존 AI비서 호출 메커니즘과의 연결점 (2026-08-13 확정)
+
+실사 결과, "AI비서가 매 요청마다 새 경로를 찾지 않고 검증된 경로를 인출"하는 메커니즘은
+이미 존재한다 — `K-Compose`(SP-20) STEP 1이 `procedure_maps.goal`로 캐시를 조회해
+hit(status:active)이면 즉시 재사용하고, miss면 STEP 1-B(최초 조사) 후 신규 등재한다.
+`procedure_maps.steps`는 `[{seq, atom_id, org_id, condition, parallel_group, ...}, ...]`
+형태의 JSON 배열로, "이 목표를 이루려면 어느 기관·절차를 거쳐야 하는가"라는 **구조**를
+캐싱한다.
+
+다만 이 캐시엔 **시간 차원이 없다** — `procedure_maps`/`org_profiles`/`atom_rows` 스키마
+전수 확인 결과 처리시간·소요시간 관련 필드가 전혀 없다. Pathfinder가 이 구조 캐시와
+경쟁하는 별도 캐시를 새로 만들 이유는 없고, 대신 **이 캐시가 원래 갖지 못한 "시간" 차원을
+공급하는 계층**으로 자리잡는다.
+
+**결정된 통합 방식**: `procedure_maps.steps`의 각 step 객체에 `pathfinder` 서브필드를
+신설한다.
+
+```json
+{
+  "seq": 1,
+  "atom_id": "court-filing",
+  "org_id": "court-seoul-rehab",
+  "pathfinder": {
+    "predicted_duration_sec": 259200,
+    "sample_size": 47,
+    "confidence": "medium",
+    "computed_at": "2026-08-13",
+    "source": "dept_task_events_aggregate"
+  }
+}
+```
+
+- `predicted_duration_sec`/`sample_size`/`confidence`: 2.1의 회귀 모델 산출값 — 표본이
+  적으면(`sample_size` 낮음) `confidence: low`로 표시해 K-Compose가 과신하지 않게 한다
+- `computed_at`: `org_profiles.as_of_date`와 같은 관례(정적 정보 최신성 표기)를 시간
+  가중치에도 그대로 적용
+- `source`: 값의 출처를 명시(향후 다른 산출 방식이 추가될 수 있으므로)
+- **프라이버시**: 이 필드는 집계된 예측값만 담는다 — `origin_pdv_report_id`나 GUID 등
+  개별 식별 정보는 절대 포함하지 않는다(6장 화이트리스트 쿼리 원칙과 동일)
+
+**갱신 주기**: 실시간 계산이 아니라, v1(배치 리포트, 8장 3번) 산출물이 주기적으로
+`procedure_maps.steps[].pathfinder`를 갱신해 쓰는 방식 — K-Compose STEP1 캐시 조회는
+그대로 유지하면서 조회 결과에 이미 최신 가중치가 실려 있게 한다
+
+**해결되지 않은 연결고리 (다음 결정 필요)**: `procedure_maps.steps[].atom_id`/`org_id`와
+Pathfinder의 집계 키(`dept_tasks.task_type` × `target_id`)가 서로 다른 이름공간이다 —
+atom_id는 `atom_rows`(REPORT/DECISION/PAY/QUERY/ADJUDICATE 패턴 카탈로그) 소속이고,
+dept_task는 GOV_TASK의 `agency`/`task_key`에서 파생된다. 이 둘을 잇는 명시적 매핑(또는
+정규화 규칙)이 아직 없다 — atom_id 실행이 실제로 어떤 GOV_TASK(agency/task_key)를
+호출하는지는 `_execReport`/`_execDecision` 등 실행부 코드마다 다르게 구현돼 있어, 이
+매핑을 먼저 확정해야 `predicted_duration_sec`를 실제로 채울 수 있다
+
+**2.2(전역 최적화, min-cost flow)와의 관계**: 이 확장은 K-Compose의 "단건 캐시 조회"
+시점에 가중치를 얹어주는 것까지다 — 동시에 들어오는 여러 요청을 함께 조율하는 진짜
+전역 최적화(2.2)는 캐시 조회만으로는 안 되고, 별도의 실시간 배정 서비스(v3, 4장 참고)가
+필요하다는 한계는 그대로 남는다. 즉 이번 통합은 v1→v2(라우팅 힌트) 전환의 구체적
+구현 지점이지, v3(전역 최적화)를 대체하지 않는다.
+
+
 
 구조 자체가 바뀔 수 있다는 전제 하에, 그래프 분석 기법으로 "무엇을 바꿀지"를 찾는다.
 
